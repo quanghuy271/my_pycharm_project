@@ -367,7 +367,7 @@ if __name__ == "__main__":
     era5_pipeline(
         base_dir="ERA5",
         start_date="1940-01-01",
-        end_date="2000-12-31",
+        end_date="2024-12-31",
         hours=[0,6,12,18],
         variables=[
             "t", "z",
