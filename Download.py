@@ -251,10 +251,10 @@ def extract_era5_grid(nc_file, var_name,
 # ===============================
 def nc_to_grid_excel(nc_file, excel_file, var_name):
     # vùng cắt dữ liệu
-    lat_low_bound = 18
-    lat_up_bound = 24
-    long_low_bound = 102
-    long_up_bound = 110
+    lat_low_bound = 7
+    lat_up_bound = 83
+    long_low_bound = 0
+    long_up_bound = 137
 
     grid_2d = extract_era5_grid(
         nc_file, var_name,
