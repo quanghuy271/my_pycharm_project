@@ -1278,19 +1278,25 @@ import time
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+import torch.distributed as dist                                        # <-- DDP: THÊM
+from torch.nn.parallel import DistributedDataParallel as DDP            # <-- DDP: THÊM
+from torch.utils.data.distributed import DistributedSampler             # <-- DDP: THÊM
 
 
 def train(cfg: Config, resume: bool = True, checkpoint_every_steps: int = 200,
           freeze_epochs: int = FREEZE_PRETRAINED_EPOCHS):
-    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+    dist.init_process_group(backend="gloo")                           # <-- DDP: THÊM (Windows không có NCCL)
+    is_main = dist.get_rank() == 0                                     # <-- DDP: THÊM (máy 1 = rank 0)
+    device = torch.device("cuda:0")                                    # <-- DDP: SỬA (mỗi máy có 1 GPU)
     torch.manual_seed(cfg.seed)
 
     dataset = build_typhoon_sequences(
         cfg.data.root_dir, cfg.data.n_in, cfg.data.n_out, cfg.data.stride,
         cfg.data.image_size, max_median_gap_hours=3.0,
     )
+    sampler = DistributedSampler(dataset, shuffle=True, seed=cfg.seed)  # <-- DDP: THÊM (chia đôi dữ liệu cho 2 máy)
     loader = DataLoader(
-        dataset, batch_size=cfg.train.batch_size, shuffle=True,
+        dataset, batch_size=cfg.train.batch_size, sampler=sampler,     # <-- DDP: SỬA (shuffle=True -> sampler=sampler)
         num_workers=cfg.data.num_workers, pin_memory=True,
         persistent_workers=cfg.data.num_workers > 0,
     )
@@ -1309,7 +1315,9 @@ def train(cfg: Config, resume: bool = True, checkpoint_every_steps: int = 200,
     opt = _build_optimizer(model, cfg, frozen)
     scaler = GradScaler(enabled=cfg.train.amp)
 
+    resumed = 0                                                        # <-- DDP: THÊM
     if resume and os.path.isfile(ckpt_path):
+        resumed = 1                                                    # <-- DDP: THÊM
         # đọc trước "frozen" đã lưu để dựng đúng optimizer (số param group) rồi mới load_state_dict
         raw = torch.load(ckpt_path, map_location=device)
         frozen = raw["frozen"]
@@ -1318,26 +1326,39 @@ def train(cfg: Config, resume: bool = True, checkpoint_every_steps: int = 200,
         start_epoch, history, frozen = load_checkpoint(ckpt_path, model, opt, scaler, device)
         print(f"Đã resume từ checkpoint: tiếp tục từ epoch {start_epoch + 1}, frozen={frozen}")
 
+    # <-- DDP: THÊM - 2 máy phải cùng resume (hoặc cùng bắt đầu mới) từ cùng 1 epoch,
+    #     nếu lệch thì báo lỗi ngay thay vì train sai hoặc treo
+    ep = torch.tensor([start_epoch, -start_epoch, resumed, -resumed], dtype=torch.int64)
+    dist.all_reduce(ep, op=dist.ReduceOp.MAX)
+    if ep[0].item() != -ep[1].item() or ep[2].item() != -ep[3].item():
+        raise RuntimeError("Checkpoint của 2 máy không khớp nhau. Xoá thư mục checkpoints trên CẢ 2 máy "
+                           "để train lại từ đầu, hoặc copy checkpoints/checkpoint_latest.pt từ máy 1 sang máy 2.")
+
+    ddp_model = DDP(model, device_ids=[0])                             # <-- DDP: THÊM
+
     for epoch in range(start_epoch, cfg.train.epochs):
         if frozen and epoch >= freeze_epochs:
             frozen = False
             set_pretrained_trainable(model, True)
             opt = _build_optimizer(model, cfg, frozen)
+            del ddp_model                                              # <-- DDP: THÊM
+            ddp_model = DDP(model, device_ids=[0])                     # <-- DDP: THÊM (bọc lại để đồng bộ cả encoder/decoder vừa mở khóa)
             print(f"Epoch {epoch + 1}: mở khóa encoder/decoder pretrained (lr encoder/decoder = lr x0.1)")
 
         model.train()
+        sampler.set_epoch(epoch)                                       # <-- DDP: THÊM (mỗi epoch xáo trộn khác nhau)
         opt.zero_grad(set_to_none=True)
 
         running = {"mse": 0.0, "mae": 0.0, "ssim": 0.0, "psnr": 0.0, "l_total": 0.0}
         n_batches = len(loader)
         epoch_start = time.time()
 
-        pbar = tqdm(loader, total=n_batches, leave=False,
+        pbar = tqdm(loader, total=n_batches, leave=False, disable=not is_main,   # <-- DDP: SỬA (chỉ máy 1 hiện thanh tiến trình)
                     desc=f"Epoch {epoch + 1}/{cfg.train.epochs}")
         for i, (x, y) in enumerate(pbar):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             with autocast(device_type=device.type, enabled=cfg.train.amp):
-                pred, inter = model(x, return_intermediates=True)
+                pred, inter = ddp_model(x, return_intermediates=True)  # <-- DDP: SỬA (model -> ddp_model)
                 l_moment = inter[-1]["l_moment"]
                 loss, logs = criterion(pred, y, l_moment)
                 loss = loss / cfg.train.grad_accum_steps
@@ -1374,7 +1395,12 @@ def train(cfg: Config, resume: bool = True, checkpoint_every_steps: int = 200,
 
         pbar.close()
 
-        n_samples = len(dataset)
+        # <-- DDP: SỬA - cộng số liệu của cả 2 máy (thay cho n_samples = len(dataset))
+        keys = ["mse", "mae", "ssim", "psnr", "l_total"]
+        t = torch.tensor([running[k] for k in keys] + [float(len(sampler))], dtype=torch.float64)
+        dist.all_reduce(t)
+        running = dict(zip(keys, t[:-1].tolist()))
+        n_samples = t[-1].item()
         epoch_time = time.time() - epoch_start
         epoch_metrics = {k: v / n_samples for k, v in running.items()}
         epoch_metrics["epoch"] = epoch
@@ -1382,17 +1408,19 @@ def train(cfg: Config, resume: bool = True, checkpoint_every_steps: int = 200,
         history.append(epoch_metrics)
 
         remaining = epoch_time * (cfg.train.epochs - epoch - 1)
-        print(
-            f"Epoch {epoch + 1}/{cfg.train.epochs} | "
-            f"loss={epoch_metrics['l_total']:.4f} mse={epoch_metrics['mse']:.4f} "
-            f"mae={epoch_metrics['mae']:.4f} ssim={epoch_metrics['ssim']:.4f} "
-            f"psnr={epoch_metrics['psnr']:.2f} | "
-            f"{_fmt_time(epoch_time)}/epoch, còn lại ~{_fmt_time(remaining)}"
-        )
+        if is_main:                                                    # <-- DDP: THÊM
+            print(
+                f"Epoch {epoch + 1}/{cfg.train.epochs} | "
+                f"loss={epoch_metrics['l_total']:.4f} mse={epoch_metrics['mse']:.4f} "
+                f"mae={epoch_metrics['mae']:.4f} ssim={epoch_metrics['ssim']:.4f} "
+                f"psnr={epoch_metrics['psnr']:.2f} | "
+                f"{_fmt_time(epoch_time)}/epoch, còn lại ~{_fmt_time(remaining)}"
+            )
 
         save_checkpoint(ckpt_path, model, opt, scaler, epoch,
                          epoch_finished=True, history=history, frozen=frozen)
 
+    dist.destroy_process_group()                                       # <-- DDP: THÊM
     return model, history
 
 # %%
@@ -1626,10 +1654,12 @@ def run_inference(cfg: Config, model: nn.Module, steps: int = 1):
 # %%
 # ===== Điểm chạy chính khi chạy bằng: python train_ddp.py =====
 if __name__ == "__main__":
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))   # luôn chạy từ thư mục chứa train_ddp.py
     cfg = Config()
     cfg.data.root_dir = r"E:\minhan_storm_trajectory_final_v2\digital_typhoon_datasets\image_png"
     cfg.data.num_workers = 4
     cfg.train.epochs = 100
-    cfg.train.batch_size = 32
+    cfg.train.batch_size = 32          # mỗi máy 32 x 2 máy = tương đương batch 64
+    cfg.train.grad_accum_steps = 1     # 2 máy: để 1 (nếu chạy lại 1 máy thì đặt 2)
     cfg.train.checkpoint_dir = "checkpoints"
     train(cfg, resume=True, checkpoint_every_steps=200)
